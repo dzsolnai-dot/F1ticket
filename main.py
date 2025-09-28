@@ -8,16 +8,23 @@ from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
 from datetime import datetime
 
+# Deta import (deta csomag szükséges a requirements-ben)
+from deta import Deta
+
 app = Flask(__name__)
 
-# Konfiguráció (Render-en ENV változókból állítjuk)
+# --- KONFIG ---
 URL = os.environ.get("URL", "https://forma1club.hu/")
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # másodpercben
-STATE_FILE = os.environ.get("STATE_FILE", "last_hash.txt")
-
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # másodperc
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TEST_KEY = os.environ.get("TEST_KEY", "")
+# --- END KONFIG ---
+
+# Deta init: ha DETA_PROJECT_KEY van környezeti változóban (Deta kezelni fogja),
+# akkor deta = Deta() automatikusan csatlakozik
+deta = Deta()  # ha nem deployolod Deta-ra, akkor lokálisan error lesz (de lokális teszthez nem kell)
+base = deta.Base("site_watcher_state")  # egy Base táblát használunk az állapot tárolására
 
 status = {
     "last_check": None,
@@ -50,22 +57,25 @@ def get_page_hash(url):
     h = hashlib.sha256(content.encode("utf-8")).hexdigest()
     return h, content
 
-def read_last_hash(path):
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                return f.read().strip()
-        except:
-            return None
+# Deta Base - read/write last_hash
+def read_last_hash_from_base():
+    try:
+        item = base.get("state")  # kulcs: "state"
+        if item and "last_hash" in item:
+            return item["last_hash"]
+    except Exception as e:
+        print("Hiba Base olvasáskor:", e)
     return None
 
-def write_last_hash(path, h):
-    with open(path, "w") as f:
-        f.write(h)
+def write_last_hash_to_base(h):
+    try:
+        base.put({"key": "state", "last_hash": h, "updated_at": datetime.utcnow().isoformat() + "Z"})
+    except Exception as e:
+        print("Hiba Base íráskor:", e)
 
 def watcher():
     print("Watcher thread elindult, figyelt:", URL)
-    last = read_last_hash(STATE_FILE)
+    last = read_last_hash_from_base()
     if last:
         status["last_hash"] = last
     while True:
@@ -73,7 +83,7 @@ def watcher():
             h, content = get_page_hash(URL)
             status["last_check"] = datetime.utcnow().isoformat() + "Z"
             if last is None:
-                write_last_hash(STATE_FILE, h)
+                write_last_hash_to_base(h)
                 last = h
                 status["last_hash"] = h
                 print("Első ellenőrzés - hash elmentve.")
@@ -83,7 +93,7 @@ def watcher():
                 msg = f"VÁLTOZÁS észlelve: {URL}\n\n{snippet}"
                 if send_telegram(msg):
                     status["last_change_at"] = datetime.utcnow().isoformat() + "Z"
-                write_last_hash(STATE_FILE, h)
+                write_last_hash_to_base(h)
                 last = h
                 status["last_hash"] = h
             else:
@@ -92,7 +102,7 @@ def watcher():
             print("Watcher hiba:", e)
         time.sleep(CHECK_INTERVAL)
 
-# watcher indítása külön szálon (gunicorn importáláskor lefut)
+# watcher indítása külön szálon
 threading.Thread(target=watcher, daemon=True).start()
 
 @app.route("/")
@@ -105,7 +115,6 @@ def home():
         "last_change_at": status["last_change_at"],
     })
 
-# Teszt végpont: hívhatod: https://<your-service>/test?key=TESZT_KULCS
 @app.route("/test")
 def test():
     key = request.args.get("key", "")
@@ -115,5 +124,5 @@ def test():
     return "Teszt üzenet elküldve."
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
